@@ -1,18 +1,28 @@
 use std::{
+    collections::BTreeMap,
     fmt::{self, Debug},
     marker::PhantomData,
     ops::RangeInclusive,
-    pin::{Pin, pin},
+    pin::Pin,
     str::FromStr,
     task::{Context, Poll},
 };
 
-use anyhow::{Context as _, bail};
-use futures::{Stream, StreamExt as _, TryStreamExt as _, future::Either, stream};
+use anyhow::{Context as _, anyhow, bail};
+use fixed::types::U32F32;
+use futures::{
+    Stream, StreamExt as _, TryStreamExt as _,
+    future::{self, Either},
+    stream,
+};
 use monostate::MustBe;
-use serde::{Deserialize, Deserializer, de::DeserializeOwned};
+use num::Zero;
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeOwned, IgnoredAny},
+};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
-use tracing::{debug, error, info_span, trace};
+use tracing::{debug, error, info, info_span, instrument::Instrument as _, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -22,61 +32,267 @@ async fn main() {
 
 async fn _main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive("lotech_take_home=debug".parse().unwrap())
+                .from_env_lossy(),
+        )
         .pretty()
         .init();
-    let mut st = pin!(depth_updates::<MustBe!("BNBBTC"), String, String>(
-        "wss://stream.binance.com:9443/ws/bnbbtc@depth",
-    ));
-    while let Some(it) = st.next().await {
-        let DepthUpdate {
-            bids,
-            asks,
-            ixs: ids,
-            ..
-        } = it.unwrap();
-        println!(
-            "{}..={} = {}\t{}+{} = {}",
-            ids.start(),
-            ids.end(),
-            ids.clone().count(),
-            bids.len(),
-            asks.len(),
-            bids.len() + asks.len()
-        )
-    }
+    let client = reqwest::Client::new();
+    future::join(
+        follow::<MustBe!("BNBBTC"), U32F32, U32F32>(
+            &client,
+            "wss://stream.binance.com:9443/ws/bnbbtc@depth",
+            "https://api.binance.com/api/v3/depth?symbol=BNBBTC&limit=5000",
+            "BNBBTC",
+        ),
+        follow::<IgnoredAny, U32F32, U32F32>(
+            &client,
+            "wss://stream.binance.com:9443/ws/btcusdt@depth",
+            "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=5000",
+            "BTCUSDT",
+        ),
+    )
+    .await;
 }
 
-async fn orderbook<
-    MakeStreamF,
-    FetchSnapshotF,
+async fn follow<SymbolT, PriceT, QuantityT>(
+    client: &reqwest::Client,
+    ws: &str,
+    snap: &str,
+    symbol: &str,
+) -> !
+where
+    PriceT: Ord + Clone + fmt::Display + Debug + PartialEq + FromStr,
+    PriceT::Err: fmt::Display,
+    QuantityT: Zero + FromStr + Debug,
+    QuantityT::Err: fmt::Display,
+    SymbolT: Debug + DeserializeOwned,
+{
+    _follow(
+        || depth_updates::<SymbolT, PriceT, QuantityT>(ws),
+        || async {
+            Ok(client
+                .get(snap)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        },
+    )
+    .instrument(info_span!("follow", symbol))
+    .await;
+}
+
+/// "Testable" core.
+async fn _follow<
+    MakeStreamFn,
+    FetchSnapshotFn,
     DepthUpdateSt,
     FetchSnapshotFut,
     SymbolT,
     PriceT,
     QuantityT,
 >(
-    mut make_stream: MakeStreamF,
-    mut fetch_snapshot: FetchSnapshotF,
-) where
-    MakeStreamF: FnMut() -> DepthUpdateSt,
-    FetchSnapshotF: FnMut() -> FetchSnapshotFut,
+    mut make_stream: MakeStreamFn,
+    mut fetch_snapshot: FetchSnapshotFn,
+) -> !
+where
+    MakeStreamFn: FnMut() -> DepthUpdateSt,
+    FetchSnapshotFn: FnMut() -> FetchSnapshotFut,
     DepthUpdateSt: Stream<Item = anyhow::Result<DepthUpdate<SymbolT, PriceT, QuantityT>>>,
     FetchSnapshotFut: Future<Output = anyhow::Result<Snapshot<PriceT, QuantityT>>>,
+    PriceT: Ord + Clone + fmt::Display + PartialEq,
+    QuantityT: Zero,
 {
-    'stream: loop {
-        let stream = pin!(make_stream().peekable());
-        match stream.peek().await {
-            Some(Ok(first)) => todo!(),
+    /// > Since depth snapshots retrieved from the API have a limit on the number of price levels
+    /// > (5000 on each side maximum),
+    /// > you won't learn the quantities for the levels outside of the initial snapshot unless they change.
+    ///
+    /// [binance docs](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#how-to-manage-a-local-order-book-correctly).
+    const LEVEL_LIMIT: usize = 5000;
+
+    let mut current_orderbook = None::<Orderbook<PriceT, QuantityT>>;
+    let mut current_stream = None;
+    let mut current_spread = None::<(PriceT, PriceT)>;
+    loop {
+        let Some(stream) = &mut current_stream else {
+            debug!("start stream");
+            // TODO(aatifsyed): rephrase with stack pinning
+            current_stream = Some(Box::pin(
+                make_stream()
+                    .scan(None, |state, res| {
+                        let res = check_event_ixs(state, res);
+                        async move { res } // this phrasing is required to free lifetime 'state
+                    })
+                    .peekable(),
+            ));
+            continue;
+        };
+        let mut stream = stream.as_mut();
+
+        let Some(orderbook) = current_orderbook.take() else {
+            debug!("populate orderbook");
+
+            match fetch_snapshot().await {
+                Ok(snapshot) => {
+                    debug!(ix = snapshot.ix, "fetched snapshot");
+                    if snapshot.asks.len() >= LEVEL_LIMIT {
+                        warn!("may have been unable to fetch full snapshot of asks")
+                    }
+                    if snapshot.bids.len() >= LEVEL_LIMIT {
+                        warn!("may have been unable to fetch full snapshot of bids")
+                    }
+                    match stream.peek().await {
+                        Some(Ok(first)) => {
+                            if snapshot.ix < *first.ixs.start() {
+                                debug!(
+                                    stream_start = *first.ixs.start(),
+                                    "snapshot predates stream"
+                                );
+                                continue;
+                            }
+                            current_orderbook = Some(snapshot.into());
+                        }
+                        Some(Err(e)) => {
+                            let error = &**e;
+                            error!(error, "stream failed");
+                            current_stream = None;
+                            continue;
+                        }
+                        None => {
+                            error!("stream ended");
+                            current_stream = None;
+                            continue;
+                        }
+                    };
+                }
+                Err(e) => {
+                    let error = &*e;
+                    error!(error, "snapshot failed");
+                }
+            };
+            continue;
+        };
+
+        match stream.next().await {
+            Some(Ok(upd)) => match orderbook.fold(upd) {
+                Ok(ob) => {
+                    if let (Some((bid, _)), Some((ask, _))) =
+                        (ob.bids.last_key_value(), ob.asks.first_key_value())
+                    {
+                        let spread = (bid.clone(), ask.clone());
+                        if current_spread.is_none_or(|it| it != spread) {
+                            info!(%bid, %ask, num_bids = ob.bids.len(), num_asks = ob.asks.len());
+                        }
+                        current_spread = Some(spread)
+                    };
+                    current_orderbook = Some(ob)
+                }
+                Err(e) => {
+                    let error = &*e;
+                    error!(error, "corrupt");
+                }
+            },
             Some(Err(e)) => {
-                let error: &dyn std::error::Error = e.as_ref();
-                error!(error, "failed to start stream, retrying...");
-                break 'stream;
+                let error = &*e;
+                error!(error, "stream failed");
+                current_stream = None;
             }
             None => {
-                error!("failed to start stream, retrying...");
-                break 'stream;
+                error!("stream ended");
+                current_stream = None;
             }
+        }
+    }
+}
+
+/// Yield an [`Err`] if we miss any [`EventIx`]s on a stream of [`DepthUpdate`]s.
+fn check_event_ixs<SymbolT, PriceT, QuantityT>(
+    state: &mut Option<EventIx>,
+    res: anyhow::Result<DepthUpdate<SymbolT, PriceT, QuantityT>>,
+) -> Option<anyhow::Result<DepthUpdate<SymbolT, PriceT, QuantityT>>> {
+    match res {
+        Ok(depth_update) => {
+            let start = *depth_update.ixs.start();
+            let end = *depth_update.ixs.end();
+            if start > end {
+                return Some(Err(anyhow!("bad event indices on wire: {start} > {end}")));
+            }
+            if let Some(prev_end) = state {
+                if start != (*prev_end + 1) {
+                    return Some(Err(anyhow!(
+                        "missing events on wire between {prev_end} and {start}"
+                    )));
+                }
+            }
+            *state = Some(*depth_update.ixs.end());
+            Some(Ok(depth_update))
+        }
+        Err(e) => Some(Err(e)),
+    }
+}
+
+struct Orderbook<PriceT, QuantityT> {
+    update_ix: EventIx,
+    /// Map value must never be zero.
+    bids: BTreeMap<PriceT, QuantityT>,
+    /// Map value must never be zero.
+    asks: BTreeMap<PriceT, QuantityT>,
+}
+
+impl<PriceT, QuantityT> Orderbook<PriceT, QuantityT> {
+    fn fold<T>(mut self, upd: DepthUpdate<T, PriceT, QuantityT>) -> anyhow::Result<Self>
+    where
+        PriceT: Ord,
+        QuantityT: Zero,
+    {
+        let DepthUpdate {
+            bids, asks, ixs, ..
+        } = upd;
+        if *ixs.end() < self.update_ix {
+            debug!("skip early event");
+            return Ok(self);
+        }
+        self.update_ix = *ixs.end();
+        for (side, levels) in [(&mut self.bids, bids), (&mut self.asks, asks)] {
+            // BTreeMap has no concept of reservation,
+            // so this explicit for-loop doesn't cost anything.
+            for (price, qty) in levels {
+                match qty.is_zero() {
+                    true => side.remove(&price),
+                    false => side.insert(price, qty),
+                };
+            }
+        }
+        if let (Some((max_bid, _)), Some((min_ask, _))) =
+            (self.bids.last_key_value(), self.asks.first_key_value())
+        {
+            if max_bid > min_ask {
+                bail!("order book has been crossed")
+            }
+        }
+        debug_assert!(
+            !self
+                .bids
+                .values()
+                .chain(self.asks.values())
+                .any(Zero::is_zero)
+        );
+        Ok(self)
+    }
+}
+
+impl<PriceT: Ord, QuantityT: Zero> From<Snapshot<PriceT, QuantityT>>
+    for Orderbook<PriceT, QuantityT>
+{
+    fn from(Snapshot { ix, bids, asks }: Snapshot<PriceT, QuantityT>) -> Self {
+        Self {
+            update_ix: ix,
+            bids: bids.into_iter().filter(|(_, qty)| !qty.is_zero()).collect(),
+            asks: asks.into_iter().filter(|(_, qty)| !qty.is_zero()).collect(),
         }
     }
 }
@@ -95,7 +311,7 @@ where
     QuantityT::Err: fmt::Display,
 {
     // early evaluation of `remote` relaxes the `Unpin` bound
-    // TODO(aatifsyed): upstream ^this to tokio_tungstenite
+    // TODO(aatifsyed): upstream writing like this to tokio_tungstenite
     match remote.into_client_request() {
         Ok(req) => {
             let uri = req.uri();
@@ -146,15 +362,29 @@ where
 }
 
 /// Monotonically increasing number assigned to successive events against a book.
-type EventIx = u32;
+type EventIx = u64;
 
 /// See [binance docs](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints#order-book).
 #[derive(Debug, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
+#[serde(bound(deserialize = "
+    PriceT: FromStr,
+    PriceT::Err: fmt::Display,
+    QuantityT: FromStr,
+    QuantityT::Err: fmt::Display,
+"))]
 struct Snapshot<PriceT, QuantityT> {
+    #[serde(rename = "lastUpdateId")]
     ix: EventIx,
+    #[serde(deserialize_with = "levels")]
     bids: Vec<(PriceT, QuantityT)>,
+    #[serde(deserialize_with = "levels")]
     asks: Vec<(PriceT, QuantityT)>,
+}
+
+#[test]
+fn snapshot() {
+    serde_json::from_str::<Snapshot<U32F32, U32F32>>(include_str!("../snapshot.json")).unwrap();
 }
 
 /// See [binance docs](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#diff-depth-stream).
@@ -172,15 +402,74 @@ struct DepthUpdate<SymbolT, PriceT, QuantityT> {
     ixs: RangeInclusive<EventIx>,
 }
 
-/// We want to use [`fixed`]-point numeric types most of the time,
-/// but their [`serde`] impls don't cover JSON strings
-/// (which is how Binance expose their numbers).
+#[test]
+fn depth_update() {
+    for line in include_str!("../stream.ndjson").lines() {
+        serde_json::from_str::<DepthUpdate<MustBe!("BNBBTC"), U32F32, U32F32>>(line).unwrap();
+    }
+}
+
+/// Deserialize a `["123", "456"]` list via [`FromStr`], without allocating intermediate strings.
 ///
-/// Rather than create shim numeric types,
-/// which are always a hassle,
-/// go via [`FromStr`] (avoiding extraneous allocations),
-/// since _whichever_ numeric library we use,
-/// it should definitely have those impls.
+/// `(PriceT, QuantityT)` is clear enough in our code that we don't need a `Level` struct.
+/// Just keep using the tuple.
+fn levels<'de, PriceT, QuantityT, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<(PriceT, QuantityT)>, D::Error>
+where
+    PriceT: FromStr,
+    PriceT::Err: fmt::Display,
+    QuantityT: FromStr,
+    QuantityT::Err: fmt::Display,
+{
+    #[derive(Deserialize)]
+    #[serde(bound(deserialize = "
+        PriceT: FromStr,
+        PriceT::Err: fmt::Display,
+        QuantityT: FromStr,
+        QuantityT::Err: fmt::Display,
+    "))]
+    struct Level<PriceT, QuantityT>(
+        #[serde(deserialize_with = "from_str")] PriceT,
+        #[serde(deserialize_with = "from_str")] QuantityT,
+    );
+
+    /// Most implementation of this kind of function allocate a string first,
+    /// but since we know we're parsing numbers _without_ special characters,
+    /// we can avoid the allocation.
+    fn from_str<'de, T, D: Deserializer<'de>>(d: D) -> Result<T, D::Error>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        struct Visitor<T>(PhantomData<T>);
+        impl<T> serde::de::Visitor<'_> for Visitor<T>
+        where
+            T: FromStr,
+            T::Err: fmt::Display,
+        {
+            type Value = T;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_fmt(format_args!(
+                    "a string that can be parsed as a {}",
+                    std::any::type_name::<T>()
+                ))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                v.parse().map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_str(Visitor(PhantomData))
+    }
+
+    // we're somewhat relying on this recollection to be a no-op
+    Ok(Vec::<Level<PriceT, QuantityT>>::deserialize(d)?
+        .into_iter()
+        .map(|Level(prc, qty)| (prc, qty))
+        .collect())
+}
+
+/// Breaking this impl block out allows us to check the event type.
 impl<'de, SymbolT, PriceT, QuantityT> Deserialize<'de> for DepthUpdate<SymbolT, PriceT, QuantityT>
 where
     SymbolT: Deserialize<'de>,
@@ -190,43 +479,6 @@ where
     QuantityT::Err: fmt::Display,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(bound(deserialize = "
-            PriceT: FromStr,
-            PriceT::Err: fmt::Display,
-            QuantityT: FromStr,
-            QuantityT::Err: fmt::Display,
-        "))]
-        struct Level<PriceT, QuantityT>(
-            #[serde(deserialize_with = "from_str")] PriceT,
-            #[serde(deserialize_with = "from_str")] QuantityT,
-        );
-
-        fn from_str<'de, T, D: Deserializer<'de>>(d: D) -> Result<T, D::Error>
-        where
-            T: FromStr,
-            T::Err: fmt::Display,
-        {
-            struct Visitor<T>(PhantomData<T>);
-            impl<T> serde::de::Visitor<'_> for Visitor<T>
-            where
-                T: FromStr,
-                T::Err: fmt::Display,
-            {
-                type Value = T;
-                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    f.write_fmt(format_args!(
-                        "a string that can be parsed as a {}",
-                        std::any::type_name::<T>()
-                    ))
-                }
-                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                    v.parse().map_err(serde::de::Error::custom)
-                }
-            }
-            d.deserialize_str(Visitor(PhantomData))
-        }
-
         #[derive(Deserialize)]
         #[serde(bound(deserialize = "
             SymbolT: Deserialize<'de>,
@@ -250,10 +502,10 @@ where
             ix0: EventIx,
             #[serde(rename = "u")]
             ixn: EventIx,
-            #[serde(rename = "b")]
-            bids: Vec<Level<PriceT, QuantityT>>,
-            #[serde(rename = "a")]
-            asks: Vec<Level<PriceT, QuantityT>>,
+            #[serde(deserialize_with = "levels", rename = "b")]
+            bids: Vec<(PriceT, QuantityT)>,
+            #[serde(deserialize_with = "levels", rename = "a")]
+            asks: Vec<(PriceT, QuantityT)>,
         }
         let _DepthUpdate {
             e: _,
@@ -265,15 +517,8 @@ where
         } = _DepthUpdate::deserialize(deserializer)?;
         Ok(DepthUpdate {
             symbol,
-            // these recollections shouldn't reallocate
-            bids: bids
-                .into_iter()
-                .map(|Level(price, qty)| (price, qty))
-                .collect(),
-            asks: asks
-                .into_iter()
-                .map(|Level(price, qty)| (price, qty))
-                .collect(),
+            bids,
+            asks,
             ixs: ix0..=ixn,
         })
     }

@@ -117,6 +117,9 @@ where
     let mut current_orderbook = None::<Orderbook<PriceT, QuantityT>>;
     let mut current_stream = None;
     let mut current_spread = None::<(PriceT, PriceT)>;
+
+    // FIXME(aatifsyed): if the stream is interrupted and resumed,
+    //                   we don't dump the orderbook
     loop {
         let Some(stream) = &mut current_stream else {
             debug!("start stream");

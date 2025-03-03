@@ -3,7 +3,7 @@ use std::{
     fmt::{self, Debug},
     marker::PhantomData,
     ops::RangeInclusive,
-    pin::Pin,
+    pin::{Pin, pin},
     str::FromStr,
     task::{Context, Poll},
 };
@@ -44,14 +44,22 @@ async fn _main() {
         follow::<MustBe!("BNBBTC"), U32F32, U32F32>(
             &client,
             "wss://stream.binance.com:9443/ws/bnbbtc@depth",
+            // TODO(aatifsyed): `snap` and `warn_threshold` duplicate the API limit.
             "https://api.binance.com/api/v3/depth?symbol=BNBBTC&limit=5000",
             "BNBBTC",
+            // > Since depth snapshots retrieved from the API have a limit on the number of price levels
+            // > (5000 on each side maximum),
+            // > you won't learn the quantities for the levels outside of the initial snapshot unless they change.
+            //
+            // [binance docs](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#how-to-manage-a-local-order-book-correctly).
+            5000,
         ),
         follow::<IgnoredAny, U32F32, U32F32>(
             &client,
             "wss://stream.binance.com:9443/ws/btcusdt@depth",
             "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=5000",
             "BTCUSDT",
+            5000,
         ),
     )
     .await;
@@ -62,6 +70,7 @@ async fn follow<SymbolT, PriceT, QuantityT>(
     ws: &str,
     snap: &str,
     symbol: &str,
+    warn_threshold: usize,
 ) -> !
 where
     PriceT: Ord + Clone + fmt::Display + Debug + PartialEq + FromStr,
@@ -81,132 +90,156 @@ where
                 .json()
                 .await?)
         },
+        warn_threshold,
     )
     .instrument(info_span!("follow", symbol))
-    .await;
+    .await
 }
 
-/// "Testable" core.
-async fn _follow<
-    MakeStreamFn,
-    FetchSnapshotFn,
-    DepthUpdateSt,
-    FetchSnapshotFut,
-    SymbolT,
-    PriceT,
-    QuantityT,
->(
+/// The functional core of the application.
+/// This is NOT testable as written,
+/// and would require rewriting one of the following to get there:
+/// - a observe/break path out of the infinite loop.
+/// - a core/shell pattern
+///
+/// This is a faithful transcription of [the binance docs](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#how-to-manage-a-local-order-book-correctly).
+///
+/// This does NOT handle the case of a trivial disconnection from the event stream
+/// in the most efficient way - it rebuilds the orderbook every time.
+async fn _follow<MakeStreamFn, FetchSnapshotFn, DepthUpdateSt, SymbolT, PriceT, QuantityT>(
     mut make_stream: MakeStreamFn,
     mut fetch_snapshot: FetchSnapshotFn,
+    warn_threshold: usize,
 ) -> !
 where
     MakeStreamFn: FnMut() -> DepthUpdateSt,
-    FetchSnapshotFn: FnMut() -> FetchSnapshotFut,
     DepthUpdateSt: Stream<Item = anyhow::Result<DepthUpdate<SymbolT, PriceT, QuantityT>>>,
-    FetchSnapshotFut: Future<Output = anyhow::Result<Snapshot<PriceT, QuantityT>>>,
-    PriceT: Ord + Clone + fmt::Display + PartialEq,
+    FetchSnapshotFn: AsyncFnMut() -> anyhow::Result<Snapshot<PriceT, QuantityT>>,
+    PriceT: Ord + fmt::Display,
     QuantityT: Zero,
+    PriceT: Clone,
+    PriceT: Debug,
 {
-    /// > Since depth snapshots retrieved from the API have a limit on the number of price levels
-    /// > (5000 on each side maximum),
-    /// > you won't learn the quantities for the levels outside of the initial snapshot unless they change.
-    ///
-    /// [binance docs](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#how-to-manage-a-local-order-book-correctly).
-    const LEVEL_LIMIT: usize = 5000;
-
-    let mut current_orderbook = None::<Orderbook<PriceT, QuantityT>>;
-    let mut current_stream = None;
-    let mut current_spread = None::<(PriceT, PriceT)>;
-
-    // FIXME(aatifsyed): if the stream is interrupted and resumed,
-    //                   we don't dump the orderbook
     loop {
-        let Some(stream) = &mut current_stream else {
-            debug!("start stream");
-            // TODO(aatifsyed): rephrase with stack pinning
-            current_stream = Some(Box::pin(
-                make_stream()
-                    .scan(None, |state, res| {
-                        let res = check_event_ixs(state, res);
-                        async move { res } // this phrasing is required to free lifetime 'state
-                    })
-                    .peekable(),
-            ));
-            continue;
-        };
-        let mut stream = stream.as_mut();
-
-        let Some(orderbook) = current_orderbook.take() else {
-            debug!("populate orderbook");
-
-            match fetch_snapshot().await {
-                Ok(snapshot) => {
-                    debug!(ix = snapshot.ix, "fetched snapshot");
-                    if snapshot.asks.len() >= LEVEL_LIMIT {
-                        warn!("may have been unable to fetch full snapshot of asks")
-                    }
-                    if snapshot.bids.len() >= LEVEL_LIMIT {
-                        warn!("may have been unable to fetch full snapshot of bids")
-                    }
-                    match stream.peek().await {
-                        Some(Ok(first)) => {
-                            if snapshot.ix < *first.ixs.start() {
-                                debug!(
-                                    stream_start = *first.ixs.start(),
-                                    "snapshot predates stream"
-                                );
-                                continue;
-                            }
-                            current_orderbook = Some(snapshot.into());
-                        }
-                        Some(Err(e)) => {
-                            let error = &**e;
-                            error!(error, "stream failed");
-                            current_stream = None;
-                            continue;
-                        }
-                        None => {
-                            error!("stream ended");
-                            current_stream = None;
-                            continue;
-                        }
-                    };
-                }
-                Err(e) => {
-                    let error = &*e;
-                    error!(error, "snapshot failed");
-                }
-            };
-            continue;
-        };
-
-        match stream.next().await {
-            Some(Ok(upd)) => match orderbook.fold(upd) {
-                Ok(ob) => {
-                    if let (Some((bid, _)), Some((ask, _))) =
-                        (ob.bids.last_key_value(), ob.asks.first_key_value())
-                    {
-                        let spread = (bid.clone(), ask.clone());
-                        if current_spread.is_none_or(|it| it != spread) {
-                            info!(%bid, %ask, num_bids = ob.bids.len(), num_asks = ob.asks.len());
-                        }
-                        current_spread = Some(spread)
-                    };
-                    current_orderbook = Some(ob)
-                }
-                Err(e) => {
-                    let error = &*e;
-                    error!(error, "corrupt");
-                }
-            },
+        // 1. Open a WebSocket connection to wss://stream.binance.com:9443/ws/bnbbtc@depth.
+        let mut stream = pin!(
+            make_stream()
+                .scan(None, |state, res| {
+                    let res = check_event_ixs(state, res);
+                    async move { res } // this phrasing is required to free lifetime 'state
+                })
+                .peekable()
+        );
+        // 2. Buffer the events received from the stream. Note the U of the first event you received.
+        debug!("start stream");
+        let stream_start = match stream.as_mut().peek().await {
+            Some(Ok(upd)) => *upd.ixs.start(),
             Some(Err(e)) => {
-                let error = &*e;
+                let error = &**e;
                 error!(error, "stream failed");
-                current_stream = None;
+                continue;
             }
             None => {
                 error!("stream ended");
-                current_stream = None;
+                continue;
+            }
+        };
+        // 3. Get a depth snapshot from https://api.binance.com/api/v3/depth?symbol=BNBBTC&limit=5000.
+        // 4. If the lastUpdateId from the snapshot is strictly less than the U from step 2, go back to step 3.
+        let snapshot = loop {
+            debug!("fetch snapshot");
+            match fetch_snapshot().await {
+                Ok(snap) if snap.ix < stream_start => {
+                    debug!(snapshot = snap.ix, stream_start, "snapshot predates streem")
+                }
+                Ok(snap) => {
+                    if snap.asks.len() > warn_threshold {
+                        warn!("may have missed asks in snapshot")
+                    }
+                    if snap.bids.len() > warn_threshold {
+                        warn!("may have missed asks in snapshot")
+                    }
+                    break snap;
+                }
+                Err(e) => {
+                    let error = &*e;
+                    error!(error, "couldn't fetch snapshot")
+                }
+            }
+        };
+        debug!(snapshot.ix);
+        // 5. In the buffered events, discard any event where u is <= lastUpdateId of the snapshot.
+        //    The first buffered event should now have lastUpdateId within its [U;u] range.
+        let mut stream = pin!(stream.try_skip_while(move |upd| {
+            let should_skip = *upd.ixs.end() <= snapshot.ix;
+            async move { Ok(should_skip) }
+        }));
+        // 6. Set your local order book to the snapshot. Its update ID is lastUpdateId.
+        let mut orderbook = Orderbook::from(snapshot);
+        let mut current_spread = None::<(PriceT, PriceT)>;
+        // 7. Apply the update procedure below to all buffered events, and then to all subsequent events received.
+
+        loop {
+            match stream.next().await {
+                Some(Ok(upd)) => {
+                    let update_indices = upd.ixs;
+                    let orderbook_ix = orderbook.update_ix;
+                    // 1. If the event u (last update ID) is < the update ID of your local order book, ignore the event.
+                    if update_indices.end() < &orderbook.update_ix {
+                        trace!(?update_indices, orderbook_ix, "ignoring early event");
+                        continue;
+                    }
+                    // 2. If the event U (first update ID) is > the update ID of your local order book, something went wrong.
+                    //   Discard your local order book and restart the process from the beginning.
+                    if update_indices.start() > &(orderbook.update_ix + 1) {
+                        //         NOTE: deviation from protocol text ^^^
+                        error!(?update_indices, orderbook_ix, "out-of-order event");
+                        continue;
+                    }
+                    for (side, levels) in [
+                        (&mut orderbook.bids, upd.bids),
+                        (&mut orderbook.asks, upd.asks),
+                    ] {
+                        // 3. For each price level in bids (b) and asks (a), set the new quantity in the order book:
+                        //   - If the price level does not exist in the order book, insert it with new quantity.
+                        //   - If the quantity is zero, remove the price level from the order book.
+                        for (price, qty) in levels {
+                            // BTreeMap has no concept of reservation,
+                            // so this explicit for-loop doesn't cost anything.
+                            match qty.is_zero() {
+                                true => side.remove(&price),
+                                false => side.insert(price, qty),
+                            };
+                        }
+                    }
+                    // 4. Set the order book update ID to the last update ID (u) in the processed event.
+                    orderbook.update_ix = *update_indices.end();
+
+                    if let (Some((bid, _)), Some((ask, _))) = (
+                        orderbook.bids.last_key_value(),
+                        orderbook.asks.first_key_value(),
+                    ) {
+                        if bid > ask {
+                            error!(%bid, %ask, "orderbook has been crossed");
+                            break;
+                        }
+
+                        let spread = (bid.clone(), ask.clone());
+                        if current_spread.is_none_or(|it| it != spread) {
+                            info!(%bid, %ask, num_bids = orderbook.bids.len(), num_asks = orderbook.asks.len(), "new spread");
+                        }
+                        current_spread = Some(spread);
+                    }
+                }
+                Some(Err(e)) => {
+                    let error = &*e;
+                    error!(error, "stream failed");
+                    break;
+                }
+                None => {
+                    error!("stream ended");
+                    break;
+                }
             }
         }
     }
@@ -244,48 +277,6 @@ struct Orderbook<PriceT, QuantityT> {
     bids: BTreeMap<PriceT, QuantityT>,
     /// Map value must never be zero.
     asks: BTreeMap<PriceT, QuantityT>,
-}
-
-impl<PriceT, QuantityT> Orderbook<PriceT, QuantityT> {
-    fn fold<T>(mut self, upd: DepthUpdate<T, PriceT, QuantityT>) -> anyhow::Result<Self>
-    where
-        PriceT: Ord,
-        QuantityT: Zero,
-    {
-        let DepthUpdate {
-            bids, asks, ixs, ..
-        } = upd;
-        if *ixs.end() < self.update_ix {
-            debug!("skip early event");
-            return Ok(self);
-        }
-        self.update_ix = *ixs.end();
-        for (side, levels) in [(&mut self.bids, bids), (&mut self.asks, asks)] {
-            // BTreeMap has no concept of reservation,
-            // so this explicit for-loop doesn't cost anything.
-            for (price, qty) in levels {
-                match qty.is_zero() {
-                    true => side.remove(&price),
-                    false => side.insert(price, qty),
-                };
-            }
-        }
-        if let (Some((max_bid, _)), Some((min_ask, _))) =
-            (self.bids.last_key_value(), self.asks.first_key_value())
-        {
-            if max_bid > min_ask {
-                bail!("order book has been crossed")
-            }
-        }
-        debug_assert!(
-            !self
-                .bids
-                .values()
-                .chain(self.asks.values())
-                .any(Zero::is_zero)
-        );
-        Ok(self)
-    }
 }
 
 impl<PriceT: Ord, QuantityT: Zero> From<Snapshot<PriceT, QuantityT>>
@@ -344,7 +335,7 @@ where
                         Message::Frame(frame) => unreachable!("unexpected raw frame: {frame:?}"),
                     }
                 })
-                .inspect_ok(|update| debug!(?update, "depth update"));
+                .inspect_ok(|update| trace!(?update, "depth update"));
             Either::Right(InstrumentedStream::new(stream, span))
         }
         Err(e) => Either::Left(stream::once(async move {

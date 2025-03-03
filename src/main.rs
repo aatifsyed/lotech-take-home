@@ -157,7 +157,7 @@ where
                         warn!("may have missed asks in snapshot")
                     }
                     if snap.bids.len() > warn_threshold {
-                        warn!("may have missed asks in snapshot")
+                        warn!("may have missed bids in snapshot")
                     }
                     break snap;
                 }
